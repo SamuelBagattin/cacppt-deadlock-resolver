@@ -1,0 +1,10 @@
+deploy/
+.dockerignore
+*.md
+chart/
+.github/
+node_modules/
+package*.json
+release.config.js
+.version
+*.tgz

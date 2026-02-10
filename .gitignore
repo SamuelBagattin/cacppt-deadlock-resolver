@@ -1,0 +1,4 @@
+cacppt-deadlock-resolver
+node_modules/
+.version
+*.tgz

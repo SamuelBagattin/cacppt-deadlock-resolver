@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cacppt-deadlock-resolver
+  namespace: cacppt-system
+  labels:
+    app: cacppt-deadlock-resolver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cacppt-deadlock-resolver
+  template:
+    metadata:
+      labels:
+        app: cacppt-deadlock-resolver
+    spec:
+      serviceAccountName: cacppt-deadlock-resolver
+      containers:
+        - name: controller
+          image: ghcr.io/samuelbagattin/cacppt-deadlock-resolver:latest
+          env:
+            - name: POLL_INTERVAL
+              value: "20"
+            - name: STUCK_THRESHOLD
+              value: "120"
+            - name: DRY_RUN
+              value: "false"
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Mi
