@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"sync"
 	"time"
 
@@ -236,36 +237,47 @@ func (c *Controller) reconcileTCP(ctx context.Context, tcp *unstructured.Unstruc
 		}
 		log.Warn("etcd member list failed on endpoint, trying next", "endpoint", ip, "error", lastErr)
 	}
-	if lastErr != nil && etcdMembers == nil {
-		return fmt.Errorf("getting etcd members failed on all %d endpoints: %w", len(healthyIPs), lastErr)
-	}
-	log.Info("etcd member list", "members", etcdMembers, "count", len(etcdMembers))
 
-	// Build member set for fast lookup
-	memberSet := make(map[string]bool, len(etcdMembers))
-	for _, m := range etcdMembers {
-		memberSet[m] = true
-	}
-
-	// Find the stuck machine: not in etcd, no DeletionTimestamp, has a nodeRef
 	var stuck *MachineInfo
-	for i := range machines {
-		m := &machines[i]
-		if m.HasDeletionTS || m.NodeName == "" {
-			continue
-		}
-		if !memberSet[m.NodeName] {
-			stuck = m
-			break
-		}
-	}
 
-	if stuck == nil {
-		log.Warn("all machines are etcd members, not the expected deadlock pattern, resetting")
-		c.mu.Lock()
-		c.states[key] = &ClusterState{}
-		c.mu.Unlock()
-		return nil
+	if lastErr != nil && etcdMembers == nil {
+		// Fallback: etcd member list failed on all endpoints.
+		// Try to identify the stuck machine from TCP conditions instead.
+		log.Warn("etcd member list failed on all endpoints, falling back to TCP conditions",
+			"endpoints", len(healthyIPs), "error", lastErr)
+		stuck = findStuckMachineFromConditions(tcp.Object, machines)
+		if stuck == nil {
+			return fmt.Errorf("getting etcd members failed on all %d endpoints and no stuck machine found in TCP conditions: %w", len(healthyIPs), lastErr)
+		}
+		log.Info("identified stuck machine from TCP conditions", "machine", stuck.Name, "node", stuck.NodeName)
+	} else {
+		log.Info("etcd member list", "members", etcdMembers, "count", len(etcdMembers))
+
+		// Build member set for fast lookup
+		memberSet := make(map[string]bool, len(etcdMembers))
+		for _, m := range etcdMembers {
+			memberSet[m] = true
+		}
+
+		// Find the stuck machine: not in etcd, no DeletionTimestamp, has a nodeRef
+		for i := range machines {
+			m := &machines[i]
+			if m.HasDeletionTS || m.NodeName == "" {
+				continue
+			}
+			if !memberSet[m.NodeName] {
+				stuck = m
+				break
+			}
+		}
+
+		if stuck == nil {
+			log.Warn("all machines are etcd members, not the expected deadlock pattern, resetting")
+			c.mu.Lock()
+			c.states[key] = &ClusterState{}
+			c.mu.Unlock()
+			return nil
+		}
 	}
 
 	log.Info("found stuck machine", "machine", stuck.Name, "node", stuck.NodeName)
@@ -304,6 +316,54 @@ func (c *Controller) listMachines(ctx context.Context, ns, clusterName string) (
 		machines = append(machines, extractMachineInfo(&machineList.Items[i]))
 	}
 	return machines, nil
+}
+
+// machineNameFromConditionRe matches machine names in CACPPT condition messages like:
+// `machine "k8s-control-plane-r7s5b": Service etcd is unhealthy: Finished`
+// `error checking etcd health on machine "k8s-control-plane-r7s5b": ...`
+var machineNameFromConditionRe = regexp.MustCompile(`machine "([^"]+)"`)
+
+// findStuckMachineFromConditions identifies the stuck machine by parsing
+// EtcdClusterHealthy and ControlPlaneComponentsHealthy condition messages.
+// This is a fallback for when talosctl etcd member list is unreachable.
+func findStuckMachineFromConditions(obj map[string]interface{}, machines []MachineInfo) *MachineInfo {
+	// Check both etcd-related conditions for machine names
+	for _, condType := range []string{"EtcdClusterHealthyCondition", "ControlPlaneComponentsHealthy"} {
+		msg := getConditionMessage(obj, condType)
+		if msg == "" {
+			continue
+		}
+		matches := machineNameFromConditionRe.FindStringSubmatch(msg)
+		if len(matches) < 2 {
+			continue
+		}
+		machineName := matches[1]
+		for i := range machines {
+			if machines[i].Name == machineName && !machines[i].HasDeletionTS {
+				return &machines[i]
+			}
+		}
+	}
+	return nil
+}
+
+func getConditionMessage(obj map[string]interface{}, condType string) string {
+	conditions, found, _ := unstructured.NestedSlice(obj, "status", "conditions")
+	if !found {
+		return ""
+	}
+	for _, c := range conditions {
+		cond, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := cond["type"].(string); t == condType {
+			if m, _ := cond["message"].(string); m != "" {
+				return m
+			}
+		}
+	}
+	return ""
 }
 
 func getConditionStatus(obj map[string]interface{}, condType string) string {
