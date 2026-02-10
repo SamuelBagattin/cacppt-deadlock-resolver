@@ -24,7 +24,6 @@ type Config struct {
 	StuckThreshold time.Duration
 	DryRun         bool
 	HealthPort     int
-	TalosctlPath   string
 	TCPAPIVersion  string
 	Kubeconfig     string
 }
@@ -47,7 +46,7 @@ Detection:
   EtcdClusterHealthy=False + machines > desired replicas for > threshold
 
 Resolution:
-  Cross-reference etcd member list (via talosctl) with Machine list,
+  Cross-reference etcd member list (via Talos gRPC API) with Machine list,
   find Machine not in etcd, and delete it to unblock the rollout.
 
 All flags can also be set via environment variables (flag takes precedence).`,
@@ -61,7 +60,6 @@ All flags can also be set via environment variables (flag takes precedence).`,
 	f.String("stuck-threshold", "120s", "Time before a deadlock is confirmed (env: STUCK_THRESHOLD)")
 	f.Bool("dry-run", false, "Log actions without executing them (env: DRY_RUN)")
 	f.Int("health-port", 8080, "Port for health check endpoints (env: HEALTH_PORT)")
-	f.String("talosctl-path", "talosctl", "Path to talosctl binary (env: TALOSCTL_PATH)")
 	f.String("tcp-api-version", "v1alpha3", "TalosControlPlane API version (env: TCP_API_VERSION)")
 	f.String("kubeconfig", "", "Path to kubeconfig file for out-of-cluster usage (env: KUBECONFIG)")
 	f.String("log-level", "info", "Log level: debug, info, warn, error (env: LOG_LEVEL)")
@@ -92,7 +90,6 @@ func run(cmd *cobra.Command, _ []string) error {
 		StuckThreshold: stuckThreshold,
 		DryRun:         mustGetBool(f, "dry-run"),
 		HealthPort:     mustGetInt(f, "health-port"),
-		TalosctlPath:   mustGetString(f, "talosctl-path"),
 		TCPAPIVersion:  mustGetString(f, "tcp-api-version"),
 		Kubeconfig:     mustGetString(f, "kubeconfig"),
 	}

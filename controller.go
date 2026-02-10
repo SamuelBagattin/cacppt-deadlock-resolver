@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"regexp"
 	"sync"
 	"time"
 
@@ -27,7 +25,6 @@ type Controller struct {
 	states        map[string]*ClusterState
 	mu            sync.Mutex
 	logger        *slog.Logger
-	tmpDir        string
 }
 
 // ClusterState tracks deadlock detection timing per cluster.
@@ -75,18 +72,12 @@ func NewController(cfg Config, logger *slog.Logger) (*Controller, error) {
 		return nil, fmt.Errorf("creating kubernetes client: %w", err)
 	}
 
-	tmpDir, err := os.MkdirTemp("", "cacppt-*")
-	if err != nil {
-		return nil, fmt.Errorf("creating temp dir: %w", err)
-	}
-
 	return &Controller{
 		dynamicClient: dynClient,
 		kubeClient:    kubeClient,
 		config:        cfg,
 		states:        make(map[string]*ClusterState),
 		logger:        logger,
-		tmpDir:        tmpDir,
 	}, nil
 }
 
@@ -100,8 +91,6 @@ func (c *Controller) tcpGVR() schema.GroupVersionResource {
 
 // Run starts the main polling loop. Blocks until ctx is cancelled.
 func (c *Controller) Run(ctx context.Context) {
-	defer os.RemoveAll(c.tmpDir)
-
 	ticker := time.NewTicker(c.config.PollInterval)
 	defer ticker.Stop()
 
@@ -213,71 +202,53 @@ func (c *Controller) reconcileTCP(ctx context.Context, tcp *unstructured.Unstruc
 		"machines", machineCount, "desired", desired)
 
 	// Get talosconfig from cluster secret
-	talosconfig, err := c.getTalosconfig(ctx, ns, clusterName)
+	cfg, err := c.getTalosClientConfig(ctx, ns, clusterName)
 	if err != nil {
 		log.Warn("cannot get talosconfig, skipping", "error", err)
 		return nil
 	}
 
-	// Find reachable control plane nodes
-	healthyIPs, err := c.findHealthyEndpoints(ctx, talosconfig, machines)
-	if err != nil {
-		log.Warn("cannot reach any machine via Talos API, skipping", "error", err)
+	// Collect candidate endpoints from machine addresses
+	endpoints := collectEndpoints(machines)
+	if len(endpoints) == 0 {
+		log.Warn("no candidate endpoints found, skipping")
 		return nil
 	}
 
-	// Try each healthy endpoint for etcd member list until one succeeds
-	var etcdMembers []string
-	var lastErr error
-	for _, ip := range healthyIPs {
-		log.Info("querying etcd members", "endpoint", ip)
-		etcdMembers, lastErr = c.getEtcdMembers(ctx, talosconfig, ip)
-		if lastErr == nil {
-			break
-		}
-		log.Warn("etcd member list failed on endpoint, trying next", "endpoint", ip, "error", lastErr)
+	// Query etcd members via gRPC, trying each endpoint until one succeeds
+	log.Info("querying etcd members", "endpoints", endpoints)
+	etcdMembers, err := c.getEtcdMembers(ctx, cfg, endpoints)
+	if err != nil {
+		return err
 	}
 
+	log.Info("etcd member list", "members", etcdMembers, "count", len(etcdMembers))
+
+	// Build member set for fast lookup
+	memberSet := make(map[string]bool, len(etcdMembers))
+	for _, m := range etcdMembers {
+		memberSet[m] = true
+	}
+
+	// Find the stuck machine: not in etcd, no DeletionTimestamp, has a nodeRef
 	var stuck *MachineInfo
-
-	if lastErr != nil && etcdMembers == nil {
-		// Fallback: etcd member list failed on all endpoints.
-		// Try to identify the stuck machine from TCP conditions instead.
-		log.Warn("etcd member list failed on all endpoints, falling back to TCP conditions",
-			"endpoints", len(healthyIPs), "error", lastErr)
-		stuck = findStuckMachineFromConditions(tcp.Object, machines)
-		if stuck == nil {
-			return fmt.Errorf("getting etcd members failed on all %d endpoints and no stuck machine found in TCP conditions: %w", len(healthyIPs), lastErr)
+	for i := range machines {
+		m := &machines[i]
+		if m.HasDeletionTS || m.NodeName == "" {
+			continue
 		}
-		log.Info("identified stuck machine from TCP conditions", "machine", stuck.Name, "node", stuck.NodeName)
-	} else {
-		log.Info("etcd member list", "members", etcdMembers, "count", len(etcdMembers))
-
-		// Build member set for fast lookup
-		memberSet := make(map[string]bool, len(etcdMembers))
-		for _, m := range etcdMembers {
-			memberSet[m] = true
+		if !memberSet[m.NodeName] {
+			stuck = m
+			break
 		}
+	}
 
-		// Find the stuck machine: not in etcd, no DeletionTimestamp, has a nodeRef
-		for i := range machines {
-			m := &machines[i]
-			if m.HasDeletionTS || m.NodeName == "" {
-				continue
-			}
-			if !memberSet[m.NodeName] {
-				stuck = m
-				break
-			}
-		}
-
-		if stuck == nil {
-			log.Warn("all machines are etcd members, not the expected deadlock pattern, resetting")
-			c.mu.Lock()
-			c.states[key] = &ClusterState{}
-			c.mu.Unlock()
-			return nil
-		}
+	if stuck == nil {
+		log.Warn("all machines are etcd members, not the expected deadlock pattern, resetting")
+		c.mu.Lock()
+		c.states[key] = &ClusterState{}
+		c.mu.Unlock()
+		return nil
 	}
 
 	log.Info("found stuck machine", "machine", stuck.Name, "node", stuck.NodeName)
@@ -316,57 +287,6 @@ func (c *Controller) listMachines(ctx context.Context, ns, clusterName string) (
 		machines = append(machines, extractMachineInfo(&machineList.Items[i]))
 	}
 	return machines, nil
-}
-
-// machineNameFromConditionRe matches machine names in CACPPT condition messages like:
-// `machine "k8s-control-plane-r7s5b": Service etcd is unhealthy: Finished`
-// `error checking etcd health on machine "k8s-control-plane-r7s5b": ...`
-var machineNameFromConditionRe = regexp.MustCompile(`machine "([^"]+)"`)
-
-// findStuckMachineFromConditions identifies the stuck machine by parsing
-// ControlPlaneComponentsHealthy and EtcdClusterHealthy condition messages.
-// ControlPlaneComponentsHealthy is checked first because it specifically reports
-// "Service etcd is unhealthy: Finished" on the machine that left etcd, while
-// EtcdClusterHealthy may reference any machine that detected the member count mismatch.
-// This is a fallback for when talosctl etcd member list is unreachable.
-func findStuckMachineFromConditions(obj map[string]interface{}, machines []MachineInfo) *MachineInfo {
-	for _, condType := range []string{"ControlPlaneComponentsHealthy", "EtcdClusterHealthyCondition"} {
-		msg := getConditionMessage(obj, condType)
-		if msg == "" {
-			continue
-		}
-		matches := machineNameFromConditionRe.FindStringSubmatch(msg)
-		if len(matches) < 2 {
-			continue
-		}
-		machineName := matches[1]
-		for i := range machines {
-			// Skip machines being deleted, still provisioning (no node yet), or new
-			if machines[i].Name == machineName && !machines[i].HasDeletionTS && machines[i].NodeName != "" {
-				return &machines[i]
-			}
-		}
-	}
-	return nil
-}
-
-func getConditionMessage(obj map[string]interface{}, condType string) string {
-	conditions, found, _ := unstructured.NestedSlice(obj, "status", "conditions")
-	if !found {
-		return ""
-	}
-	for _, c := range conditions {
-		cond, ok := c.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if t, _ := cond["type"].(string); t == condType {
-			if m, _ := cond["message"].(string); m != "" {
-				return m
-			}
-		}
-	}
-	return ""
 }
 
 func getConditionStatus(obj map[string]interface{}, condType string) string {
