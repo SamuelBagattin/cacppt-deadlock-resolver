@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cacppt-deadlock-resolver
+description: Resolves CACPPT (Cluster API Control Plane Provider Talos) deadlocks by detecting and remediating stuck machines
+type: application
+version: 0.0.0
+appVersion: "0.0.0"
