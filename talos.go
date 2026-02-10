@@ -50,30 +50,52 @@ func (c *Controller) getTalosconfig(ctx context.Context, ns, clusterName string)
 }
 
 // findHealthyEndpoints tries to reach each non-deleting machine via talosctl
-// and returns all responding IP addresses.
+// and returns all responding IP addresses. InternalIPs are tried first since
+// the Talos API (especially etcd) may only be reachable on private networks.
 func (c *Controller) findHealthyEndpoints(ctx context.Context, talosconfig string, machines []MachineInfo) ([]string, error) {
-	var healthy []string
+	// Collect candidate addresses: InternalIPs first, then ExternalIPs
+	type candidate struct {
+		address string
+	}
+	var candidates []candidate
+
+	// First pass: collect all InternalIPs
 	for _, m := range machines {
 		if m.HasDeletionTS {
 			continue
 		}
 		for _, addr := range m.Addresses {
-			if addr.Type != "InternalIP" && addr.Type != "ExternalIP" {
-				continue
+			if addr.Type == "InternalIP" {
+				candidates = append(candidates, candidate{address: addr.Address})
+				break // one InternalIP per machine
 			}
-
-			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			cmd := exec.CommandContext(checkCtx, c.config.TalosctlPath,
-				"--talosconfig", talosconfig,
-				"-n", addr.Address,
-				"version", "--short")
-			err := cmd.Run()
-			cancel()
-
-			if err == nil {
-				healthy = append(healthy, addr.Address)
-				break // one IP per machine is enough
+		}
+	}
+	// Second pass: collect ExternalIPs as fallback
+	for _, m := range machines {
+		if m.HasDeletionTS {
+			continue
+		}
+		for _, addr := range m.Addresses {
+			if addr.Type == "ExternalIP" {
+				candidates = append(candidates, candidate{address: addr.Address})
+				break // one ExternalIP per machine
 			}
+		}
+	}
+
+	var healthy []string
+	for _, c2 := range candidates {
+		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cmd := exec.CommandContext(checkCtx, c.config.TalosctlPath,
+			"--talosconfig", talosconfig,
+			"-n", c2.address,
+			"version", "--short")
+		err := cmd.Run()
+		cancel()
+
+		if err == nil {
+			healthy = append(healthy, c2.address)
 		}
 	}
 
