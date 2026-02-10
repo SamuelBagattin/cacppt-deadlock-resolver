@@ -324,11 +324,13 @@ func (c *Controller) listMachines(ctx context.Context, ns, clusterName string) (
 var machineNameFromConditionRe = regexp.MustCompile(`machine "([^"]+)"`)
 
 // findStuckMachineFromConditions identifies the stuck machine by parsing
-// EtcdClusterHealthy and ControlPlaneComponentsHealthy condition messages.
+// ControlPlaneComponentsHealthy and EtcdClusterHealthy condition messages.
+// ControlPlaneComponentsHealthy is checked first because it specifically reports
+// "Service etcd is unhealthy: Finished" on the machine that left etcd, while
+// EtcdClusterHealthy may reference any machine that detected the member count mismatch.
 // This is a fallback for when talosctl etcd member list is unreachable.
 func findStuckMachineFromConditions(obj map[string]interface{}, machines []MachineInfo) *MachineInfo {
-	// Check both etcd-related conditions for machine names
-	for _, condType := range []string{"EtcdClusterHealthyCondition", "ControlPlaneComponentsHealthy"} {
+	for _, condType := range []string{"ControlPlaneComponentsHealthy", "EtcdClusterHealthyCondition"} {
 		msg := getConditionMessage(obj, condType)
 		if msg == "" {
 			continue
@@ -339,7 +341,8 @@ func findStuckMachineFromConditions(obj map[string]interface{}, machines []Machi
 		}
 		machineName := matches[1]
 		for i := range machines {
-			if machines[i].Name == machineName && !machines[i].HasDeletionTS {
+			// Skip machines being deleted, still provisioning (no node yet), or new
+			if machines[i].Name == machineName && !machines[i].HasDeletionTS && machines[i].NodeName != "" {
 				return &machines[i]
 			}
 		}
