@@ -49,9 +49,10 @@ func (c *Controller) getTalosconfig(ctx context.Context, ns, clusterName string)
 	return "", fmt.Errorf("talosconfig secret not found for cluster %s/%s", ns, clusterName)
 }
 
-// findHealthyEndpoint tries to reach each non-deleting machine via talosctl
-// and returns the first responding IP address.
-func (c *Controller) findHealthyEndpoint(ctx context.Context, talosconfig string, machines []MachineInfo) (string, error) {
+// findHealthyEndpoints tries to reach each non-deleting machine via talosctl
+// and returns all responding IP addresses.
+func (c *Controller) findHealthyEndpoints(ctx context.Context, talosconfig string, machines []MachineInfo) ([]string, error) {
+	var healthy []string
 	for _, m := range machines {
 		if m.HasDeletionTS {
 			continue
@@ -70,12 +71,16 @@ func (c *Controller) findHealthyEndpoint(ctx context.Context, talosconfig string
 			cancel()
 
 			if err == nil {
-				return addr.Address, nil
+				healthy = append(healthy, addr.Address)
+				break // one IP per machine is enough
 			}
 		}
 	}
 
-	return "", fmt.Errorf("no reachable machine found via Talos API")
+	if len(healthy) == 0 {
+		return nil, fmt.Errorf("no reachable machine found via Talos API")
+	}
+	return healthy, nil
 }
 
 // getEtcdMembers queries etcd member list from the given endpoint via talosctl

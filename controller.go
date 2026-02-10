@@ -218,18 +218,26 @@ func (c *Controller) reconcileTCP(ctx context.Context, tcp *unstructured.Unstruc
 		return nil
 	}
 
-	// Find a reachable control plane node
-	healthyIP, err := c.findHealthyEndpoint(ctx, talosconfig, machines)
+	// Find reachable control plane nodes
+	healthyIPs, err := c.findHealthyEndpoints(ctx, talosconfig, machines)
 	if err != nil {
 		log.Warn("cannot reach any machine via Talos API, skipping", "error", err)
 		return nil
 	}
-	log.Info("querying etcd members", "endpoint", healthyIP)
 
-	// Get etcd member list from healthy node
-	etcdMembers, err := c.getEtcdMembers(ctx, talosconfig, healthyIP)
-	if err != nil {
-		return fmt.Errorf("getting etcd members via %s: %w", healthyIP, err)
+	// Try each healthy endpoint for etcd member list until one succeeds
+	var etcdMembers []string
+	var lastErr error
+	for _, ip := range healthyIPs {
+		log.Info("querying etcd members", "endpoint", ip)
+		etcdMembers, lastErr = c.getEtcdMembers(ctx, talosconfig, ip)
+		if lastErr == nil {
+			break
+		}
+		log.Warn("etcd member list failed on endpoint, trying next", "endpoint", ip, "error", lastErr)
+	}
+	if lastErr != nil && etcdMembers == nil {
+		return fmt.Errorf("getting etcd members failed on all %d endpoints: %w", len(healthyIPs), lastErr)
 	}
 	log.Info("etcd member list", "members", etcdMembers, "count", len(etcdMembers))
 
