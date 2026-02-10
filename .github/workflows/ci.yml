@@ -115,4 +115,5 @@ jobs:
           sed -i "s/^version: .*/version: ${VERSION}/" chart/Chart.yaml
           sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" chart/Chart.yaml
           helm package chart/
-          helm push "cacppt-deadlock-resolver-${VERSION}.tgz" oci://ghcr.io/${{ github.repository_owner }}
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          helm push "cacppt-deadlock-resolver-${VERSION}.tgz" "oci://ghcr.io/${OWNER}"
